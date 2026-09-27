@@ -78,9 +78,12 @@ referenced separately: the component of the
 value there, the others to their median; without reference point every
 component has a zero median.</p>
 <p>The per-pixel preparation (wrapped gradients, costs, residues) runs
-on an OpenCL device or on the host with OpenMP (<strong>device</strong>,
-<strong>platform</strong>, <strong>nprocs</strong>); the network flow
-and the integration run on the host CPU.</p>
+on an OpenCL device by default (<strong>device=auto</strong>: OpenCL
+GPUs, then OpenCL CPU devices), on the host with OpenMP only when no
+OpenCL device is usable, with a warning (<strong>device</strong>,
+<strong>platform</strong>, <strong>nprocs</strong>). It needs single
+precision only. The network flow and the integration run on the host
+CPU.</p>
 <h3 id="geocoding">Geocoding</h3>
 <p>With <strong>target</strong>, every product is also written, with the
 same name, in the <strong>target_mapset</strong> of that project (in the

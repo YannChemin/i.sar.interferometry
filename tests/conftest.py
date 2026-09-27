@@ -162,7 +162,6 @@ def project(tmp_path_factory, sim, library, unwrap_library):
                 reference=f"{name}_ref_iw1_vv",
                 secondary=f"{name}_sec_iw1_vv",
                 output=f"{name}_co",
-                device="host",
                 **extra,
             )
             assert proc.returncode == 0, proc.stderr

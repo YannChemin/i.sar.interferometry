@@ -904,6 +904,12 @@ class Unwrapper:
                 )
             )
         self.device = self.msg.value.decode()
+        if device == "auto" and "no OpenCL" in self.device:
+            gs.warning(
+                _("No usable OpenCL device, falling back to OpenMP: {}").format(
+                    self.device
+                )
+            )
 
     def run(self, phase, coherence, looks):
         """Unwrapped phase and connected components (1 the largest, 0
@@ -1595,7 +1601,7 @@ def main():
         if nprocs < 0:
             nprocs = max(1, (os.cpu_count() or 1) + nprocs)
         unwrapper = Unwrapper(options["device"], options["platform"], nprocs)
-        gs.verbose(_("Unwrapping preparation on {}").format(unwrapper.device))
+        gs.message(_("Unwrapping preparation on {}").format(unwrapper.device))
     settings = {
         "measures": measures,
         "removal": removal,

@@ -197,7 +197,6 @@ def subsidence(project, sim):
         reference_point=f"{lon},{lat}",
         target="utm40",
         resolution=10,
-        device="host",
     )
     assert proc.returncode == 0, proc.stderr
     offset = pair.motion(np.array([lat]), np.array([lon]))[0]
@@ -302,7 +301,6 @@ def test_unwrap_mask(project):
         output="masked",
         measure="coherence,unwrapped_phase",
         unwrap_mask=0.999,
-        device="host",
     )
     assert proc.returncode == 0, proc.stderr
     coh = read_map(project, "masked_coherence")
