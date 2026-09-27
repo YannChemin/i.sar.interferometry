@@ -47,16 +47,28 @@ def sim():
 
 @pytest.fixture(scope="session")
 def library(tmp_path_factory, sim):
-    build = tmp_path_factory.mktemp("build")
-    source = (COREG / "sarcoreg_core.h").read_text() + (
-        COREG / "sarcoreg_kernels.cl"
-    ).read_text()
+    """libsarcoreg built from the i.sar.coregistration sources."""
+    return build_library(
+        tmp_path_factory.mktemp("build"),
+        COREG,
+        "sarcoreg_core.h",
+        "sarcoreg_kernels.cl",
+        "sarcoreg.c",
+        "libsarcoreg.so",
+    )
+
+
+def build_library(build, source_dir, core, kernels, source, name):
+    """Compile a ctypes compute library with the flags of the Makefiles."""
+    text = (source_dir / core).read_text() + (source_dir / kernels).read_text()
     lines = [
         '"' + line.replace("\\", "\\\\").replace('"', '\\"') + '\\n"'
-        for line in source.splitlines()
+        for line in text.splitlines()
     ]
-    (build / "sarcoreg_cl.h").write_text("\n".join(lines) + "\n")
-    lib = build / "libsarcoreg.so"
+    (build / name.replace("lib", "").replace(".so", "_cl.h")).write_text(
+        "\n".join(lines) + "\n"
+    )
+    lib = build / name
     subprocess.run(
         [
             "gcc",
@@ -66,16 +78,29 @@ def library(tmp_path_factory, sim):
             "-fopenmp",
             "-shared",
             f"-I{build}",
-            f"-I{COREG}",
+            f"-I{source_dir}",
             "-o",
             str(lib),
-            str(COREG / "sarcoreg.c"),
+            str(source_dir / source),
             "-lOpenCL",
             "-lm",
         ],
         check=True,
     )
     return lib
+
+
+@pytest.fixture(scope="session")
+def unwrap_library(tmp_path_factory):
+    """libsarunwrap built from this source tree."""
+    return build_library(
+        tmp_path_factory.mktemp("unwrap"),
+        HERE.parent,
+        "sarunwrap_core.h",
+        "sarunwrap_kernels.cl",
+        "sarunwrap.c",
+        "libsarunwrap.so",
+    )
 
 
 def run(session, script, *flags, env_extra=None, **kwargs):
@@ -90,25 +115,33 @@ def run(session, script, *flags, env_extra=None, **kwargs):
 
 
 @pytest.fixture(scope="session")
-def project(tmp_path_factory, sim, library):
-    """XY project with two coregistered pairs:
+def project(tmp_path_factory, sim, library, unwrap_library):
+    """XY project with three coregistered pairs:
 
     - flat: 150 m baseline, flat terrain, burst maps (flat_ref_iw1_vv,
       flat_co) and debursted reference (deb_ref_iw1_vv);
     - hill: 1 km baseline over an 800 m hill, burst maps coregistered with
-      the DEM and its elevation maps (hill_ref_iw1_vv, hill_co).
+      the DEM and its elevation maps (hill_ref_iw1_vv, hill_co);
+    - defo: as flat, with a 6 cm subsidence bowl between the acquisitions
+      (defo_ref_iw1_vv, defo_co);
+
+    and a UTM 40N project utm40 next to it for the geocoded products.
     """
     pairs = {}
-    for name, (baseline, hill) in {
-        "flat": (150.0, 0.0),
-        "hill": (1000.0, 800.0),
+    for name, (baseline, hill, subsidence) in {
+        "flat": (150.0, 0.0, 0.0),
+        "hill": (1000.0, 800.0, 0.0),
+        "defo": (150.0, 0.0, 0.06),
     }.items():
         parent = tmp_path_factory.mktemp(name)
-        pair = sim.Pair(parent, baseline=baseline, terrain_height=hill)
+        pair = sim.Pair(
+            parent, baseline=baseline, terrain_height=hill, subsidence=subsidence
+        )
         dem = sim.write_dem(parent / "dem.tif", hill, pair.bbox()) if hill else None
         pairs[name] = (pair, dem)
     path = tmp_path_factory.mktemp("grassdata") / "xy"
     gs.create_project(path)
+    gs.create_project(path.parent / "utm40", epsg=32640)
     with gs.setup.init(path, env=os.environ.copy()) as session:
         coreg_env = {"I_SAR_COREGISTRATION_LIB": str(library)}
         for name, (pair, dem) in pairs.items():
@@ -138,17 +171,24 @@ def project(tmp_path_factory, sim, library):
         )
         assert proc.returncode == 0, proc.stderr
         session.pairs = pairs
+        session.unwrap_library = unwrap_library
+        session.gisdbase = path.parent
         yield session
 
 
 def run_module(session, *flags, **kwargs):
-    return run(session, SCRIPT, *flags, **kwargs)
+    env = {"I_SAR_INTERFEROMETRY_LIB": str(session.unwrap_library)}
+    return run(session, SCRIPT, *flags, env_extra=env, **kwargs)
 
 
-def read_map(session, name):
+def target_env(session, project="utm40"):
+    return gs.create_environment(session.gisdbase, project, "PERMANENT")[1]
+
+
+def read_map(session, name, env=None):
     import grass.script.array as garray
 
-    env = dict(session.env)
+    env = dict(env or session.env)
     env["GRASS_REGION"] = gs.region_env(raster=name, env=env)
     return np.array(
         garray.array(name, null="nan", dtype=np.float32, env=env), dtype=np.float64

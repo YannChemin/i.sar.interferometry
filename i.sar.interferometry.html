@@ -41,7 +41,60 @@ filtered in blocks of <strong>filter_size</strong> samples overlapping
 by three quarters: the spectrum of each block is weighted by its 3 × 3
 smoothed magnitude to the power alpha, and the blocks are recombined
 with triangular weights. The coherence is not filtered.</li>
+<li><strong>Phase unwrapping</strong> (products
+<code>unwrapped_phase</code>, <code>los_displacement</code>,
+<code>vertical_displacement</code>, <code>unwrap_component</code>):
+minimum cost flow unwrapping with statistical costs, in the spirit of
+SNAPHU (see below), of the (multilooked, filtered) phase.</li>
+<li><strong>Displacement</strong>: the line of sight displacement is -λ
+φ<sub>unw</sub> / 4π, positive towards the satellite; the vertical
+displacement is the LOS displacement divided by the cosine of the
+incidence angle, assuming a vertical motion only: subsidence is
+negative.</li>
+<li><strong>Geocoding</strong> (<strong>target</strong>): range-Doppler
+terrain correction of every product into a projected (or geographic)
+project.</li>
 </ul>
+<h3 id="phase-unwrapping">Phase unwrapping</h3>
+<p>The residues of the wrapped phase (loops of 2 × 2 pixels whose
+wrapped gradients do not sum to zero) are joined to each other or to the
+image border by a minimum cost flow in the network of the loops
+(Costantini, 1998): the flow across a pixel edge is the number of cycles
+added to the wrapped gradient there. The cost of adding n cycles to a
+gradient Δ is statistical, as in SNAPHU: ((Δ + 2πn)² - Δ²) / 2σ², σ² =
+(1 - γ²) / (2Lγ²) being the phase variance of L looks (the product of
+<strong>looks</strong>) at the coherence γ of the edge. Edges of
+coherent pixels are expensive to cut, decorrelated ones cheap, and edges
+touching null pixels free. The flow is solved exactly by successive
+shortest paths with node potentials and unit augmentations, and the
+corrected gradients are integrated over each connected component of
+non-null pixels.</p>
+<p>Pixels whose coherence is below <strong>unwrap_mask</strong> are not
+unwrapped. They are null in the unwrapped products and separate
+connected components (<code>unwrap_component</code>, 1 for the largest):
+the phase offset between two components is unknown. Each component is
+referenced separately: the component of the
+<strong>reference_point</strong> (a stable longitude, latitude) to its
+value there, the others to their median; without reference point every
+component has a zero median.</p>
+<p>The per-pixel preparation (wrapped gradients, costs, residues) runs
+on an OpenCL device or on the host with OpenMP (<strong>device</strong>,
+<strong>platform</strong>, <strong>nprocs</strong>); the network flow
+and the integration run on the host CPU.</p>
+<h3 id="geocoding">Geocoding</h3>
+<p>With <strong>target</strong>, every product is also written, with the
+same name, in the <strong>target_mapset</strong> of that project (in the
+same GISDBASE). Each target cell centre is located on the
+<strong>dem</strong> (reprojected to the target grid, EGM96 heights
+converted with <strong>dem_height=geoid</strong>), or at the mean
+terrain height of the annotation without DEM, and projected into the
+reference radar geometry by its zero-Doppler time and slant range; the
+product is sampled there, bilinearly (nearest neighbour for the wrapped
+phases and the components). The radar positions are computed exactly on
+nodes every 16 cells for two heights enclosing the terrain and
+interpolated. The target grid covers the product footprint at
+<strong>resolution</strong> (default: the ground spacing of the product
+pixels).</p>
 <h3 id="output">Output</h3>
 <p>The maps are named <code>{output}_{measure}</code>
 (<code>{output}_bNN_{measure}</code> with <strong>-b</strong>):</p>
@@ -52,7 +105,17 @@ s*) minus the synthetic phase;</li>
 <li><code>amplitude</code>: interferogram amplitude |m s*|;</li>
 <li><code>i</code>, <code>q</code> (<code>complex</code>): real and
 imaginary parts of the interferogram;</li>
-<li><code>reference_phase</code>: removed synthetic phase, wrapped.</li>
+<li><code>reference_phase</code>: removed synthetic phase, wrapped;</li>
+<li><code>incidence_angle</code>: incidence angle on the ellipsoid
+(degrees);</li>
+<li><code>unwrapped_phase</code>: unwrapped phase (radians), referenced
+as above;</li>
+<li><code>los_displacement</code>: line of sight displacement (m),
+positive towards the satellite;</li>
+<li><code>vertical_displacement</code>: vertical displacement (m),
+negative for subsidence;</li>
+<li><code>unwrap_component</code>: connected components of the
+unwrapping.</li>
 </ul>
 <p>They are FCELL maps in the radar geometry of the reference (one cell
 per sample and line, or per look), with timestamps spanning the two
@@ -72,10 +135,16 @@ control points from the reference geolocation grid, for geocoding with
 <p>The current project must be unprojected (XY). The computational
 region is not used.</p>
 <p>The interferogram is only as good as the coregistration: burst maps
-coregistered with ESD avoid phase jumps at the burst seams. Phase
-unwrapping, conversion to displacement or height and geocoding are left
-to other tools.</p>
-<p>The module requires NumPy.</p>
+coregistered with ESD avoid phase jumps at the burst seams.</p>
+<p>The displacement of a single interferogram includes the atmospheric
+delay difference of the two acquisitions and any residual orbit or DEM
+error; the vertical displacement also ignores horizontal motion. The
+unwrapping holds the whole image in memory (about 60 bytes per pixel):
+multilook large images first. Layover and shadow are not masked by the
+geocoding.</p>
+<p>The module requires NumPy, and the GDAL Python bindings for the
+geocoding. The unwrapping library <code>libsarunwrap</code> needs a C
+compiler with OpenMP and the OpenCL headers and ICD loader.</p>
 <h2 id="examples">EXAMPLES</h2>
 <p>Interferogram and coherence of a pair coregistered with a DEM, the
 topographic phase removed, with 4 × 1 looks and Goldstein filtering:</p>
@@ -83,11 +152,27 @@ topographic phase removed, with 4 × 1 looks and Goldstein filtering:</p>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    output=s1_20230124_co dem=copernicus_dem_30m.tif extra=elevation</span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">i.sar.interferometry</span> reference=s1_20230112_iw2_vv secondary=s1_20230124_co <span class="dt">\</span></span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    output=ifg_20230112_20230124 phase_removal=topography looks=4,1 filter_alpha=0.5</span></code></pre></div>
-<p>Geocode the phase and the coherence into a UTM project:</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">i.target</span> group=ifg_20230112_20230124 location=sharjah_utm40n mapset=PERMANENT</span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">i.rectify</span> <span class="at">-t</span> group=ifg_20230112_20230124 extension=_utm resolution=15</span></code></pre></div>
+<p>Subsidence map: unwrapped vertical displacement, referenced to a
+stable point, geocoded with the DEM into a UTM project at 20 m:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">grass</span> <span class="at">-c</span> EPSG:32640 <span class="va">$HOME</span>/grassdata/sharjah_utm40n <span class="at">-e</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">i.sar.interferometry</span> reference=s1_20230112_iw2_vv secondary=s1_20230124_co <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    output=defo_20230112_20230124 phase_removal=topography looks=8,2 filter_alpha=0.5 <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    measure=coherence,vertical_displacement,unwrap_component unwrap_mask=0.3 <span class="dt">\</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    reference_point=55.402,25.318 target=sharjah_utm40n resolution=20 <span class="dt">\</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    dem=copernicus_dem_30m.tif</span></code></pre></div>
+<p>The radar geometry products can also be geocoded with their ground
+control points:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">i.target</span> group=ifg_20230112_20230124 location=sharjah_utm40n mapset=PERMANENT</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">i.rectify</span> <span class="at">-t</span> group=ifg_20230112_20230124 extension=_utm resolution=15</span></code></pre></div>
 <h2 id="references">REFERENCES</h2>
 <ul>
+<li>M. Costantini, <em>A novel phase unwrapping method based on network
+programming</em>, IEEE Transactions on Geoscience and Remote Sensing,
+36(3), 813-821, 1998.</li>
+<li>C. W. Chen and H. A. Zebker, <em>Two-dimensional phase unwrapping
+with use of statistical models for cost functions in nonlinear
+optimization</em>, Journal of the Optical Society of America A, 18(2),
+338-351, 2001 (SNAPHU).</li>
 <li>R. M. Goldstein and C. L. Werner, <em>Radar interferogram filtering
 for geophysical applications</em>, Geophysical Research Letters, 25(21),
 4035-4038, 1998.</li>

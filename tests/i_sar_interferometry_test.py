@@ -7,7 +7,7 @@ import pytest
 
 import grass.script as gs
 
-from conftest import description, read_map, run_module, wrap
+from conftest import description, read_map, run_module, target_env, wrap
 
 
 def circular_std(phase):
@@ -152,6 +152,185 @@ def test_metadata_and_group(project):
     points = np.loadtxt(os.path.join(group, "POINTS"), comments="#")
     assert points.shape[1] == 5
     assert points.shape[0] > 10
+
+
+def reference_lonlat(pair, sim):
+    """A stable point: a corner of the image, far from the bowl."""
+    g = pair.ref.pixel_ground(np.array([0]), np.array([8.0]), np.array([88.0]))
+    lat, lon, _h = sim.ecef_to_geodetic(g)
+    return float(lon[0]), float(lat[0])
+
+
+def radar_truth(project, pair, sim, name):
+    """True vertical motion at every pixel of a debursted product."""
+    segments = description(project, name)["raster_geometry"]["segments"]
+    rows = sum(s["rows"] for s in segments)
+    truth = np.full((rows, sim.NSAMPLES), np.nan)
+    for seg in segments:
+        lines, samples = np.mgrid[
+            seg["first_line"] : seg["first_line"] + seg["rows"], 0 : sim.NSAMPLES
+        ]
+        g = pair.ref.pixel_ground(
+            np.full(lines.size, seg["burst"] - 1),
+            lines.ravel().astype(float),
+            samples.ravel().astype(float),
+        )
+        lat, lon, _h = sim.ecef_to_geodetic(g)
+        truth[seg["first_row"] : seg["first_row"] + seg["rows"]] = pair.motion(
+            lat, lon
+        ).reshape(lines.shape)
+    return truth
+
+
+@pytest.fixture(scope="module")
+def subsidence(project, sim):
+    """Unwrapped subsidence of the defo pair, in radar and UTM geometry."""
+    pair, _dem = project.pairs["defo"]
+    lon, lat = reference_lonlat(pair, sim)
+    proc = run_module(
+        project,
+        reference="defo_ref_iw1_vv",
+        secondary="defo_co",
+        output="defo",
+        measure="phase,coherence,unwrapped_phase,los_displacement,vertical_displacement,"
+        "incidence_angle,unwrap_component",
+        reference_point=f"{lon},{lat}",
+        target="utm40",
+        resolution=10,
+        device="host",
+    )
+    assert proc.returncode == 0, proc.stderr
+    offset = pair.motion(np.array([lat]), np.array([lon]))[0]
+    return pair, offset, proc
+
+
+def test_subsidence_radar_geometry(project, sim, subsidence):
+    pair, offset, _proc = subsidence
+    vertical = read_map(project, "defo_vertical_displacement")
+    truth = radar_truth(project, pair, sim, "defo_phase") - offset
+    # Enough motion to need unwrapping: more than one fringe.
+    assert truth.min() < -0.05
+    error = (vertical - truth)[4:-4, 6:-6]
+    assert np.nanmean(np.abs(error)) < 0.002
+    assert np.sqrt(np.nanmean(error**2)) < 0.003
+    los = read_map(project, "defo_los_displacement")
+    incidence = read_map(project, "defo_incidence_angle")
+    assert 30 < np.nanmean(incidence) < 45
+    np.testing.assert_allclose(
+        vertical, los / np.cos(np.radians(incidence)), rtol=1e-5, equal_nan=True
+    )
+    # Subsidence moves the ground away from the satellite: negative LOS.
+    assert np.nanmin(los) < -0.04
+    assert np.nanmax(read_map(project, "defo_unwrap_component")) == 1
+    meta = description(project, "defo_vertical_displacement")["interferometry"]
+    assert meta["unwrapping"]["components"] == 1
+    assert meta["unwrapping"]["reference_pixel"] is not None
+
+
+def test_subsidence_geocoded(project, sim, subsidence):
+    from osgeo import osr
+
+    pair, offset, _proc = subsidence
+    env = target_env(project)
+    geocoded = read_map(project, "defo_vertical_displacement", env=env)
+    region = gs.parse_command(
+        "g.region", flags="g", raster="defo_vertical_displacement", env=env
+    )
+    north, west, res = float(region["n"]), float(region["w"]), float(region["nsres"])
+    assert res == 10
+    rows, cols = np.nonzero(np.isfinite(geocoded))
+    assert rows.size > 1000
+    src, dst = osr.SpatialReference(), osr.SpatialReference()
+    src.ImportFromEPSG(32640)
+    dst.ImportFromEPSG(4326)
+    for srs in (src, dst):
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    to_geo = osr.CoordinateTransformation(src, dst)
+
+    def truth(shift_e, shift_n):
+        east = west + (cols + 0.5) * res + shift_e
+        northing = north - (rows + 0.5) * res + shift_n
+        pts = np.array(
+            to_geo.TransformPoints(np.column_stack([east, northing]).tolist())
+        )
+        return pair.motion(pts[:, 1], pts[:, 0]) - offset
+
+    error = geocoded[rows, cols] - truth(0.0, 0.0)
+    assert np.sqrt(np.mean(error**2)) < 0.003
+    # Geolocation: the best-fitting shift of the truth is below 5 m.
+    shifts = [
+        (de, dn)
+        for de in (-10.0, -5.0, 0.0, 5.0, 10.0)
+        for dn in (-10.0, -5.0, 0.0, 5.0, 10.0)
+    ]
+    rms = [
+        np.sqrt(np.mean((geocoded[rows, cols] - truth(de, dn)) ** 2))
+        for de, dn in shifts
+    ]
+    best = shifts[int(np.argmin(rms))]
+    assert abs(best[0]) <= 5
+    assert abs(best[1]) <= 5
+    meta = description_in(project, env, "defo_vertical_displacement")
+    assert meta["geocoding"]["method"] == "range-Doppler terrain correction"
+    assert (
+        gs.raster_info("defo_coherence", env=env)["semantic_label"]
+        == "S1_VV_IFG_COHERENCE"
+    )
+
+
+def description_in(project, env, name):
+    import json
+
+    genv = gs.gisenv(env=env)
+    path = os.path.join(
+        genv["GISDBASE"],
+        genv["LOCATION_NAME"],
+        genv["MAPSET"],
+        "cell_misc",
+        name,
+        "description.json",
+    )
+    with open(path) as fd:
+        return json.load(fd)
+
+
+def test_unwrap_mask(project):
+    proc = run_module(
+        project,
+        reference="defo_ref_iw1_vv",
+        secondary="defo_co",
+        output="masked",
+        measure="coherence,unwrapped_phase",
+        unwrap_mask=0.999,
+        device="host",
+    )
+    assert proc.returncode == 0, proc.stderr
+    coh = read_map(project, "masked_coherence")
+    unw = read_map(project, "masked_unwrapped_phase")
+    assert np.all(np.isnan(unw[coh < 0.999]))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"measure": "unwrapped_phase", "reference_point": "10,10"},
+            "outside the image",
+        ),
+        ({"target": "nowhere"}, "not found"),
+        ({"resolution": 10}, "target"),
+    ],
+)
+def test_unwrap_failures(project, kwargs, message):
+    proc = run_module(
+        project,
+        reference="defo_ref_iw1_vv",
+        secondary="defo_co",
+        output="fail",
+        **kwargs,
+    )
+    assert proc.returncode != 0
+    assert message in proc.stderr
 
 
 @pytest.mark.parametrize(

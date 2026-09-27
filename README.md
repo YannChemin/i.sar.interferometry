@@ -1,8 +1,9 @@
 # i.sar.interferometry
 
 A [GRASS GIS](https://grass.osgeo.org/) addon that computes the
-**interferogram and coherence** of a Sentinel-1 TOPS SLC pair in radar
-geometry: a reference image imported by
+**interferogram, coherence, unwrapped phase and displacement
+(subsidence) maps** of a Sentinel-1 TOPS SLC pair, in radar geometry and
+geocoded, from a reference image imported by
 [r.in.s1slc](https://github.com/YannChemin/r.in.s1slc) and a secondary
 image coregistered on it by *i.sar.coregistration*.
 
@@ -12,7 +13,9 @@ r.in.s1slc -b input=<secondary>.zip output=s1_20230124 swath=IW2 polarization=VV
 i.sar.coregistration reference=s1_20230112_iw2_vv secondary=s1_20230124_iw2_vv \
     output=s1_20230124_co dem=dem.tif extra=elevation
 i.sar.interferometry reference=s1_20230112_iw2_vv secondary=s1_20230124_co \
-    output=ifg phase_removal=topography looks=4,1 filter_alpha=0.5
+    output=ifg phase_removal=topography looks=8,2 filter_alpha=0.5 \
+    measure=coherence,vertical_displacement unwrap_mask=0.3 \
+    reference_point=<lon>,<lat> target=<utm_project> dem=dem.tif
 ```
 
 ## Features
@@ -25,7 +28,19 @@ i.sar.interferometry reference=s1_20230112_iw2_vv secondary=s1_20230124_co \
 | Debursting | default for burst inputs, `-b` to keep bursts | same geometry as the debursted reference |
 | Multilook | `looks=range,azimuth` | complex averaging |
 | Goldstein filter | `filter_alpha=`, `filter_size=` | SNAP algorithm, coherence unfiltered |
+| Unwrapping | `measure=unwrapped_phase,...`, `unwrap_mask=`, `reference_point=` | minimum cost flow, SNAPHU-like statistical costs; C + OpenCL |
+| Displacement | `measure=los_displacement,vertical_displacement` | subsidence map (vertical motion, negative down) |
+| Geocoding | `target=`, `resolution=`, `dem=` | range-Doppler terrain correction into a projected project |
 | Metadata | always | baselines, height of ambiguity, coregistration record, GCP group for *i.rectify* |
+
+## Layout
+
+| File | Role |
+|---|---|
+| `i.sar.interferometry.py` | GRASS module: interferogram, coherence, deburst, multilook, filter, displacement, geocoding |
+| `sarunwrap_core.h` | per-pixel gradients, statistical costs and residues, compiled as C99 and as OpenCL C |
+| `sarunwrap_kernels.cl` | OpenCL kernel entry point |
+| `sarunwrap.c`, `sarunwrap.h` | `libsarunwrap`: device selection, minimum cost flow solver, integration, loaded through ctypes |
 
 ## Build and test
 

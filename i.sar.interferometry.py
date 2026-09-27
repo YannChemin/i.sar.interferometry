@@ -49,10 +49,10 @@
 # % type: string
 # % required: no
 # % multiple: yes
-# % options: phase,coherence,amplitude,complex,reference_phase
+# % options: phase,coherence,amplitude,complex,reference_phase,unwrapped_phase,los_displacement,vertical_displacement,incidence_angle,unwrap_component
 # % answer: phase,coherence
 # % label: Products to write
-# % descriptions: phase;Interferometric phase (radians, wrapped);coherence;Coherence magnitude;amplitude;Interferogram amplitude |m s*|;complex;Interferogram real and imaginary parts (maps _i and _q);reference_phase;Removed flat-earth (and topographic) phase, wrapped
+# % descriptions: phase;Interferometric phase (radians, wrapped);coherence;Coherence magnitude;amplitude;Interferogram amplitude |m s*|;complex;Interferogram real and imaginary parts (maps _i and _q);reference_phase;Removed flat-earth (and topographic) phase, wrapped;unwrapped_phase;Unwrapped phase (radians), relative to the reference point;los_displacement;Line of sight displacement (m), positive towards the satellite;vertical_displacement;Vertical displacement (m) assuming vertical motion only, negative for subsidence;incidence_angle;Incidence angle on the ellipsoid (degrees);unwrap_component;Connected components of the unwrapping
 # % guisection: Output
 # %end
 
@@ -110,13 +110,111 @@
 # % guisection: Filter
 # %end
 
+# %option
+# % key: unwrap_mask
+# % type: double
+# % required: no
+# % answer: 0
+# % options: 0-1
+# % label: Coherence below which pixels are not unwrapped (0: unwrap all)
+# % description: Masked pixels are null in the unwrapped products and separate connected components
+# % guisection: Unwrapping
+# %end
+
+# %option
+# % key: reference_point
+# % type: double
+# % required: no
+# % multiple: yes
+# % key_desc: longitude,latitude
+# % label: Stable reference point of the unwrapped phase and displacements (WGS84)
+# % description: Default: the median of each connected component is zero
+# % guisection: Unwrapping
+# %end
+
+# %option
+# % key: target
+# % type: string
+# % required: no
+# % key_desc: name
+# % label: Project in which to write the geocoded (terrain corrected) products
+# % guisection: Geocoding
+# %end
+
+# %option
+# % key: target_mapset
+# % type: string
+# % required: no
+# % key_desc: name
+# % answer: PERMANENT
+# % label: Mapset of the target project
+# % guisection: Geocoding
+# %end
+
+# %option
+# % key: resolution
+# % type: double
+# % required: no
+# % label: Resolution of the geocoded products (map units of the target project)
+# % description: Default: ground spacing of the (multilooked) radar pixels
+# % guisection: Geocoding
+# %end
+
+# %option G_OPT_F_INPUT
+# % key: dem
+# % required: no
+# % label: Digital elevation model file for the geocoding (any GDAL raster, any CRS)
+# % description: Default: mean terrain height of the annotation
+# % guisection: Geocoding
+# %end
+
+# %option
+# % key: dem_height
+# % type: string
+# % required: no
+# % options: geoid,ellipsoid
+# % answer: geoid
+# % label: Height reference of the DEM
+# % descriptions: geoid;Heights above the EGM96 geoid, converted to ellipsoidal heights;ellipsoid;Heights above the WGS84 ellipsoid
+# % guisection: Geocoding
+# %end
+
+# %option
+# % key: device
+# % type: string
+# % required: no
+# % options: auto,gpu,cpu,host
+# % answer: auto
+# % label: Device of the unwrapping preparation (gradients, costs, residues)
+# % description: The network flow is always solved on the host CPU
+# % guisection: Unwrapping
+# %end
+
+# %option
+# % key: platform
+# % type: string
+# % required: no
+# % label: OpenCL platform name filter (case-insensitive substring)
+# % guisection: Unwrapping
+# %end
+
+# %option G_OPT_M_NPROCS
+# % guisection: Unwrapping
+# %end
+
 # %flag
 # % key: b
 # % label: Keep burst maps separate (do not deburst)
 # % description: With burst inputs, writes one set of maps per burst
 # %end
 
+# %rules
+# % requires: resolution,target
+# % requires: dem,target
+# %end
+
 import atexit
+import ctypes
 import json
 import os
 import sys
@@ -137,6 +235,17 @@ NODE_SAMPLES = 100
 HEIGHT_MARGIN = 50.0
 # Goldstein filter: spectrum smoothing window.
 FILTER_WINDOW = 3
+# Spacing (cells) of the geometry nodes of the geocoding.
+GEOCODE_NODES = 16
+# Products that need the unwrapped phase.
+UNWRAPPED = {
+    "unwrapped_phase",
+    "los_displacement",
+    "vertical_displacement",
+    "unwrap_component",
+}
+# Products resampled by nearest neighbour when geocoded.
+NEAREST = {"phase", "reference_phase", "unwrap_component"}
 
 TMP_FILES = []
 
@@ -507,7 +616,8 @@ class Acquisition:
 
 def synthetic_phase(ref, sec, burst, first_line, rows, cols, height):
     """Synthetic interferometric phase -4 pi (R_ref - R_sec) / lambda of
-    reference burst lines first_line ... first_line + rows - 1.
+    reference burst lines first_line ... first_line + rows - 1, and the
+    incidence angle (degrees) on the ellipsoid.
 
     Computed at geometry nodes for the ellipsoid (height None) or for two
     heights enclosing the given height map, then interpolated bilinearly
@@ -539,6 +649,8 @@ def synthetic_phase(ref, sec, burst, first_line, rows, cols, height):
         _ts, r_sec = zero_doppler(sec.orbit, p, t_guess)
         r_ref = ref.slant_range(ss.ravel())
         drs.append((r_ref - r_sec).reshape(ll.shape))
+    p = ref.ground(t, ss.ravel(), 0.0)
+    incidence = incidence_angle(ref.orbit.state(t)[0], p).reshape(ll.shape)
 
     # Bilinear interpolation of the node values to every pixel.
     pl = np.arange(first_line, first_line + rows, dtype=np.float64)
@@ -560,7 +672,21 @@ def synthetic_phase(ref, sec, burst, first_line, rows, cols, height):
     if len(heights) == 2:
         w = (height - heights[0]) / (heights[1] - heights[0])
         dr = dr + w * (interp(drs[1]) - dr)
-    return -4.0 * np.pi * dr / ref.wavelength
+    return -4.0 * np.pi * dr / ref.wavelength, interp(incidence)
+
+
+def incidence_angle(sensor, ground):
+    """Angle (degrees) between the line of sight and the ellipsoid normal."""
+    import numpy as np
+
+    lat, lon, _h = ecef_to_geodetic(ground)
+    lat, lon = np.radians(lat), np.radians(lon)
+    normal = np.stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], -1
+    )
+    los = sensor - ground
+    los /= np.linalg.norm(los, axis=-1, keepdims=True)
+    return np.degrees(np.arccos(np.clip(np.sum(los * normal, -1), -1, 1)))
 
 
 def baselines(ref, sec, burst):
@@ -719,6 +845,432 @@ def goldstein(ifg, alpha, size):
     return np.where(valid, out, np.nan + 1j * np.nan).astype(np.complex64)
 
 
+class UnwrapJob(ctypes.Structure):
+    """Mirror of struct sarunwrap_job (sarunwrap.h)."""
+
+    _fields_ = [
+        ("rows", ctypes.c_int),
+        ("cols", ctypes.c_int),
+        ("phase", ctypes.POINTER(ctypes.c_float)),
+        ("coherence", ctypes.POINTER(ctypes.c_float)),
+        ("looks", ctypes.c_float),
+        ("unwrapped", ctypes.POINTER(ctypes.c_float)),
+        ("component", ctypes.POINTER(ctypes.c_int32)),
+        ("stats", ctypes.c_int64 * 4),
+    ]
+
+
+def find_library():
+    name = "libsarunwrap.so"
+    candidates = []
+    if os.environ.get("I_SAR_INTERFEROMETRY_LIB"):
+        candidates.append(os.environ["I_SAR_INTERFEROMETRY_LIB"])
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), name))
+    for base in (os.environ.get("GRASS_ADDON_BASE"), os.environ.get("GISBASE")):
+        if base:
+            candidates.append(os.path.join(base, "etc", "i.sar.interferometry", name))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    gs.fatal(
+        _("Unwrapping library {} not found in: {}").format(name, ", ".join(candidates))
+    )
+
+
+class Unwrapper:
+    """Minimum cost flow phase unwrapping (libsarunwrap)."""
+
+    def __init__(self, device, platform, nprocs):
+        self.lib = ctypes.CDLL(find_library())
+        self.lib.sarunwrap_init.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        self.lib.sarunwrap_run.argtypes = [
+            ctypes.POINTER(UnwrapJob),
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        self.msg = ctypes.create_string_buffer(8192)
+        if self.lib.sarunwrap_init(
+            device.encode(), (platform or "").encode(), nprocs, self.msg, 8192
+        ):
+            gs.fatal(
+                _("Processing device <{}> unavailable: {}").format(
+                    device, self.msg.value.decode()
+                )
+            )
+        self.device = self.msg.value.decode()
+
+    def run(self, phase, coherence, looks):
+        """Unwrapped phase and connected components (1 the largest, 0
+        null) of a wrapped phase with nulls, and the statistics."""
+        import numpy as np
+
+        phase = np.ascontiguousarray(phase, dtype=np.float32)
+        coherence = np.ascontiguousarray(coherence, dtype=np.float32)
+        out = np.empty_like(phase)
+        comp = np.empty(phase.shape, dtype=np.int32)
+        job = UnwrapJob(
+            rows=phase.shape[0],
+            cols=phase.shape[1],
+            phase=phase.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            coherence=coherence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            looks=float(looks),
+            unwrapped=out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            component=comp.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        )
+        if self.lib.sarunwrap_run(ctypes.byref(job), self.msg, 8192):
+            gs.fatal(_("Phase unwrapping failed: {}").format(self.msg.value.decode()))
+        stats = {
+            "residues": int(job.stats[0]),
+            "components": int(job.stats[1]),
+            "augmenting_paths": int(job.stats[2]),
+            "largest_correction_cycles": int(job.stats[3]),
+        }
+        # Number the components by decreasing size.
+        sizes = np.bincount(comp.ravel())
+        sizes[0] = 0
+        order = np.argsort(-sizes, kind="stable")
+        relabel = np.zeros(sizes.size, dtype=np.int32)
+        relabel[order[: stats["components"]]] = np.arange(1, stats["components"] + 1)
+        return out, relabel[comp], stats
+
+    def finish(self):
+        self.lib.sarunwrap_finish()
+
+
+class ProductGeometry:
+    """Azimuth time and range of the rows and columns of a (multilooked)
+    product: row r is at t0 + r dt, column c at the slant range time of
+    sample (c + 0.5) looks_rg - 0.5."""
+
+    def __init__(self, acq, times, looks_rg, looks_az):
+        self.acq = acq
+        self.t0 = float(times[0]) + 0.5 * (looks_az - 1) * acq.dt
+        self.dt = acq.dt * looks_az
+        self.looks_rg = looks_rg
+
+    def radar(self, points, t_guess):
+        """Row and column (fractional, cell centres at integers) of ECEF
+        points, by zero-Doppler projection on the reference orbit."""
+        acq = self.acq
+        t, rng = zero_doppler(acq.orbit, points, t_guess)
+        sample = (2.0 * rng / C - acq.srt) * acq.fs
+        return (t - self.t0) / self.dt, (
+            sample - 0.5 * (self.looks_rg - 1)
+        ) / self.looks_rg
+
+
+def reference_pixel(geometry, lon, lat, height, rows, cols):
+    """Row and column of the product pixel imaging lon, lat."""
+    import numpy as np
+
+    p = geodetic_to_ecef(np.array([lat]), np.array([lon]), np.array([height]))
+    guess = np.array([0.5 * (geometry.acq.grid_t[0] + geometry.acq.grid_t[-1])])
+    r, c = geometry.radar(p, guess)
+    r, c = int(round(float(r[0]))), int(round(float(c[0])))
+    if not (0 <= r < rows and 0 <= c < cols):
+        gs.fatal(_("Reference point {}, {} is outside the image").format(lon, lat))
+    return r, c
+
+
+def set_reference(unw, comp, ref_rc):
+    """Subtract from each component its value at the reference pixel (its
+    component) or its median (other components). Returns the offsets."""
+    import numpy as np
+
+    offsets = {}
+    ref_comp = int(comp[ref_rc]) if ref_rc is not None else 0
+    if ref_rc is not None and ref_comp == 0:
+        gs.fatal(_("The reference point falls on a null or masked pixel"))
+    out = unw.copy()
+    for c in range(1, int(comp.max()) + 1):
+        sel = comp == c
+        if c == ref_comp:
+            r0, c0 = ref_rc
+            win = (slice(max(r0 - 1, 0), r0 + 2), slice(max(c0 - 1, 0), c0 + 2))
+            near = unw[win][comp[win] == c]
+            offsets[c] = float(np.median(near))
+        else:
+            offsets[c] = float(np.median(unw[sel]))
+        out[sel] -= offsets[c]
+    return out, offsets
+
+
+def dem_on_grid(path, height_ref, wkt, west, south, east, north, cols, rows):
+    """DEM resampled on a target grid, in ellipsoidal heights (NaN no-data)."""
+    import numpy as np
+    from osgeo import gdal, osr
+
+    gdal.UseExceptions()
+    try:
+        src = gdal.Open(path)
+    except RuntimeError as e:
+        gs.fatal(_("Unable to open DEM <{}>: {}").format(path, e))
+
+    def warp(source, nodata=True):
+        ds = gdal.Warp(
+            "",
+            source,
+            format="MEM",
+            dstSRS=wkt,
+            outputBounds=(west, south, east, north),
+            width=cols,
+            height=rows,
+            resampleAlg="bilinear",
+            dstNodata=float("nan") if nodata else None,
+            outputType=gdal.GDT_Float32,
+        )
+        return ds.GetRasterBand(1).ReadAsArray().astype(np.float64)
+
+    data = warp(src)
+    if np.all(np.isnan(data)):
+        gs.fatal(_("DEM <{}> does not cover the geocoded area").format(path))
+    if height_ref == "geoid":
+        names = ("us_nga_egm96_15.tif", "egm96_15.gtx")
+        dirs = list(osr.GetPROJSearchPaths() or []) + [
+            "/usr/share/proj",
+            "/usr/local/share/proj",
+        ]
+        grid = next(
+            (
+                os.path.join(d, n)
+                for d in dirs
+                for n in names
+                if os.path.isfile(os.path.join(d, n))
+            ),
+            None,
+        )
+        if grid is None:
+            gs.fatal(
+                _(
+                    "EGM96 geoid grid ({}) not found in the PROJ data directories {}; "
+                    "install it (e.g. projsync --file us_nga_egm96_15.tif) or use "
+                    "dem_height=ellipsoid with an ellipsoidal DEM"
+                ).format(" or ".join(names), dirs)
+            )
+        data += warp(grid, nodata=False)
+    return data
+
+
+class Geocoder:
+    """Range-Doppler terrain correction of radar products into a projected
+    target project: each target cell centre is located on the DEM (or at
+    the mean terrain height), projected into the reference radar geometry
+    by zero-Doppler time and slant range, and the product is sampled
+    there. The radar positions are computed exactly on nodes every
+    GEOCODE_NODES cells for two heights enclosing the terrain and
+    interpolated (bilinearly, and linearly in height)."""
+
+    def __init__(self, options, acq, terrain_height):
+        from osgeo import osr
+
+        osr.UseExceptions()
+
+        env = gs.gisenv()
+        target, mapset = options["target"], options["target_mapset"]
+        self.path = os.path.join(env["GISDBASE"], target, mapset)
+        if not os.path.isdir(os.path.join(env["GISDBASE"], target, "PERMANENT")):
+            gs.fatal(
+                _("Target project <{}> not found in <{}>").format(
+                    target, env["GISDBASE"]
+                )
+            )
+        if not os.path.isdir(self.path):
+            gs.fatal(
+                _("Mapset <{}> not found in target project <{}>").format(mapset, target)
+            )
+        self.env = gs.create_environment(env["GISDBASE"], target, mapset)[1]
+        self.target = target
+        self.mapset = mapset
+        self.wkt = gs.read_command("g.proj", flags="p", format="wkt", env=self.env)
+        dst = osr.SpatialReference()
+        if dst.ImportFromWkt(self.wkt) != 0:
+            gs.fatal(_("Unable to read the CRS of target project <{}>").format(target))
+        src = osr.SpatialReference()
+        src.ImportFromEPSG(4326)
+        for srs in (src, dst):
+            srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        self.geographic = bool(dst.IsGeographic())
+        self.to_map = osr.CoordinateTransformation(src, dst)
+        self.to_geo = osr.CoordinateTransformation(dst, src)
+        self.acq = acq
+        self.options = options
+        self.terrain_height = terrain_height
+
+    def transform(self, ct, x, y):
+        import numpy as np
+
+        pts = np.asarray(ct.TransformPoints(np.column_stack([x, y]).tolist()))
+        return pts[:, 0], pts[:, 1]
+
+    def setup(self, geometry, rows, cols, ground_spacing):
+        """Target grid covering the product footprint."""
+        import numpy as np
+
+        acq = self.acq
+        rr = np.r_[
+            np.linspace(0, rows - 1, 20),
+            np.zeros(20),
+            np.full(20, rows - 1.0),
+            np.linspace(0, rows - 1, 20),
+        ]
+        cc = np.r_[
+            np.zeros(20),
+            np.linspace(0, cols - 1, 20),
+            np.linspace(0, cols - 1, 20),
+            np.full(20, cols - 1.0),
+        ]
+        t = geometry.t0 + rr * geometry.dt
+        sample = (cc + 0.5) * geometry.looks_rg - 0.5
+        p = acq.ground(t, sample, self.terrain_height)
+        lat, lon, _h = ecef_to_geodetic(p)
+        e, n = self.transform(self.to_map, lon, lat)
+        if self.geographic:
+            ground_spacing /= 111320.0
+        res = (
+            float(self.options["resolution"])
+            if self.options["resolution"]
+            else ground_spacing
+        )
+        self.res = res
+        self.west = np.floor(e.min() / res) * res
+        self.east = np.ceil(e.max() / res) * res
+        self.south = np.floor(n.min() / res) * res
+        self.north = np.ceil(n.max() / res) * res
+        self.cols = int(round((self.east - self.west) / res))
+        self.rows = int(round((self.north - self.south) / res))
+        if self.options["dem"]:
+            self.height = dem_on_grid(
+                self.options["dem"],
+                self.options["dem_height"],
+                self.wkt,
+                self.west,
+                self.south,
+                self.east,
+                self.north,
+                self.cols,
+                self.rows,
+            )
+        else:
+            self.height = np.full((self.rows, self.cols), self.terrain_height)
+        self._positions(geometry)
+
+    def _positions(self, geometry):
+        import numpy as np
+
+        valid = np.isfinite(self.height)
+        heights = [
+            float(np.nanmin(self.height)) - HEIGHT_MARGIN,
+            float(np.nanmax(self.height)) + HEIGHT_MARGIN,
+        ]
+        nr = np.unique(
+            np.r_[np.arange(0, self.rows - 1, GEOCODE_NODES), self.rows - 1]
+        ).astype(float)
+        nc = np.unique(
+            np.r_[np.arange(0, self.cols - 1, GEOCODE_NODES), self.cols - 1]
+        ).astype(float)
+        if nr.size < 2:
+            nr = np.array([0.0, 1.0])
+        if nc.size < 2:
+            nc = np.array([0.0, 1.0])
+        rr, cc = np.meshgrid(nr, nc, indexing="ij")
+        e = self.west + (cc.ravel() + 0.5) * self.res
+        n = self.north - (rr.ravel() + 0.5) * self.res
+        lon, lat = self.transform(self.to_geo, e, n)
+        guess = np.full(lon.size, 0.5 * (self.acq.grid_t[0] + self.acq.grid_t[-1]))
+        nodes = []
+        for h in heights:
+            p = geodetic_to_ecef(lat, lon, np.full(lon.size, h))
+            r, c = geometry.radar(p, guess)
+            nodes.append((r.reshape(rr.shape), c.reshape(rr.shape)))
+        # Interpolate the node positions to every cell.
+        ir = np.clip(
+            np.searchsorted(nr, np.arange(self.rows), side="right") - 1, 0, nr.size - 2
+        )
+        fr = (np.arange(self.rows) - nr[ir]) / (nr[ir + 1] - nr[ir])
+        ic = np.clip(
+            np.searchsorted(nc, np.arange(self.cols), side="right") - 1, 0, nc.size - 2
+        )
+        fc = (np.arange(self.cols) - nc[ic]) / (nc[ic + 1] - nc[ic])
+
+        def interp(a):
+            top = (1 - fc) * a[ir][:, ic] + fc * a[ir][:, ic + 1]
+            bottom = (1 - fc) * a[ir + 1][:, ic] + fc * a[ir + 1][:, ic + 1]
+            return (1 - fr)[:, None] * top + fr[:, None] * bottom
+
+        w = (self.height - heights[0]) / (heights[1] - heights[0])
+        r_lo, c_lo = interp(nodes[0][0]), interp(nodes[0][1])
+        self.row = r_lo + w * (interp(nodes[1][0]) - r_lo)
+        self.col = c_lo + w * (interp(nodes[1][1]) - c_lo)
+        self.row[~valid] = np.nan
+        self.col[~valid] = np.nan
+
+    def sample(self, data, nearest):
+        """Product values at the target cells (NaN outside)."""
+        import numpy as np
+
+        rows, cols = data.shape
+        r, c = self.row, self.col
+        inside = (
+            np.isfinite(r)
+            & (r >= -0.5)
+            & (r <= rows - 0.5)
+            & (c >= -0.5)
+            & (c <= cols - 0.5)
+        )
+        out = np.full(r.shape, np.nan, dtype=np.float64)
+        rn = np.clip(np.floor(np.where(inside, r, 0) + 0.5).astype(int), 0, rows - 1)
+        cn = np.clip(np.floor(np.where(inside, c, 0) + 0.5).astype(int), 0, cols - 1)
+        near = data[rn, cn]
+        if nearest:
+            out[inside] = near[inside]
+            return out
+        r0 = np.clip(np.floor(np.where(inside, r, 0)).astype(int), 0, rows - 2)
+        c0 = np.clip(np.floor(np.where(inside, c, 0)).astype(int), 0, cols - 2)
+        fr = np.clip(r - r0, 0, 1)
+        fc = np.clip(c - c0, 0, 1)
+        value = (1 - fr) * ((1 - fc) * data[r0, c0] + fc * data[r0, c0 + 1]) + fr * (
+            (1 - fc) * data[r0 + 1, c0] + fc * data[r0 + 1, c0 + 1]
+        )
+        # Next to nulls, fall back to the nearest cell.
+        value = np.where(np.isfinite(value), value, near)
+        out[inside] = value[inside]
+        return out
+
+    def write(self, name, data, title):
+        import numpy as np
+
+        path = gs.tempfile(create=False)
+        TMP_FILES.append(path)
+        np.ascontiguousarray(data, dtype=np.float32).tofile(path)
+        gs.run_command(
+            "r.in.bin",
+            flags="f",
+            input=path,
+            output=name,
+            title=title,
+            bytes=4,
+            order="native",
+            north=self.north,
+            south=self.south,
+            east=self.east,
+            west=self.west,
+            rows=self.rows,
+            cols=self.cols,
+            anull="nan",
+            overwrite=gs.overwrite(),
+            quiet=True,
+            env=self.env,
+        )
+        os.remove(path)
+        TMP_FILES.remove(path)
+
+
 def deburst_rows(acq, bursts):
     """(burst, line) of each debursted output row, SNAP TOPSAR-Deburst rule
     as in r.in.s1slc: rows regularly sampled in azimuth time from the first
@@ -820,6 +1372,15 @@ def main():
         gs.fatal(_("looks must be two positive integers (range,azimuth)"))
     alpha = float(options["filter_alpha"])
     fsize = int(options["filter_size"])
+    need_unwrap = bool(UNWRAPPED & set(measures))
+    need_coh = "coherence" in measures or need_unwrap
+    reference_point = None
+    if options["reference_point"]:
+        reference_point = [float(v) for v in options["reference_point"].split(",")]
+        if len(reference_point) != 2:
+            gs.fatal(_("reference_point must be longitude,latitude"))
+        if not need_unwrap:
+            gs.warning(_("reference_point is only used by the unwrapped products"))
 
     ref_base, sec_base = options["reference"], options["secondary"]
     ref_deb, ref_stems = image_stems(ref_base, "reference")
@@ -885,16 +1446,30 @@ def main():
     suffixes = []
     for m in measures:
         suffixes += ["i", "q"] if m == "complex" else [m]
+    geocoder = None
+    if options["target"]:
+        terrain = float(r_meta0["swath"].get("terrain_height") or 0.0)
+        geocoder = Geocoder(options, ref, terrain)
     if not gs.overwrite():
         for stem in outputs:
             for s in suffixes:
-                if gs.find_file("{}_{}".format(stem, s), element="cell", mapset=".")[
-                    "file"
-                ]:
+                name = "{}_{}".format(stem, s)
+                if gs.find_file(name, element="cell", mapset=".")["file"]:
                     gs.fatal(
                         _(
-                            "Raster map <{}_{}> already exists, use --overwrite to replace it"
-                        ).format(stem, s)
+                            "Raster map <{}> already exists, use --overwrite to replace it"
+                        ).format(name)
+                    )
+                if (
+                    geocoder
+                    and gs.find_file(
+                        name, element="cell", mapset=geocoder.mapset, env=geocoder.env
+                    )["file"]
+                ):
+                    gs.fatal(
+                        _(
+                            "Raster map <{}> already exists in project <{}>, use --overwrite to replace it"
+                        ).format(name, geocoder.target)
                     )
 
     info = baselines(
@@ -927,18 +1502,20 @@ def main():
         if removal == "topography":
             height = read_raster(elevation_stems[s_stem], rows, cols).astype(np.float64)
         phase = np.zeros((rows, cols))
-        if removal != "none":
-            for seg in geom["segments"]:
-                r0, n = seg["first_row"], seg["rows"]
-                h = None if height is None else height[r0 : r0 + n]
-                phase[r0 : r0 + n] = synthetic_phase(
-                    ref, sec, seg["burst"] - 1, seg["first_line"], n, cols, h
-                )
-            if height is not None:
-                phase[~np.isfinite(height)] = np.nan
+        inc = np.zeros((rows, cols))
+        for seg in geom["segments"]:
+            r0, n = seg["first_row"], seg["rows"]
+            h = None if height is None else height[r0 : r0 + n]
+            phase[r0 : r0 + n], inc[r0 : r0 + n] = synthetic_phase(
+                ref, sec, seg["burst"] - 1, seg["first_line"], n, cols, h
+            )
+        if removal == "none":
+            phase[:] = 0.0
+        elif height is not None:
+            phase[~np.isfinite(height)] = np.nan
         s_flat = s * np.exp(1j * phase)
         ifg = (m * np.conj(s_flat)).astype(np.complex64)
-        coh = coherence(m, s_flat, win[0], win[1]) if "coherence" in measures else None
+        coh = coherence(m, s_flat, win[0], win[1]) if need_coh else None
         results.append(
             {
                 "geom": geom,
@@ -947,6 +1524,7 @@ def main():
                 "ifg": ifg,
                 "coh": coh,
                 "phase": phase,
+                "inc": inc,
             }
         )
 
@@ -969,9 +1547,10 @@ def main():
                 (owner.size, cols), np.nan + 1j * np.nan, dtype=np.complex64
             ),
             "coh": np.full((owner.size, cols), np.nan, dtype=np.float32)
-            if "coherence" in measures
+            if need_coh
             else None,
             "phase": np.full((owner.size, cols), np.nan),
+            "inc": np.full((owner.size, cols), np.nan),
         }
         for res, k in zip(results, bursts):
             rows_k = np.flatnonzero(owner == k)
@@ -1010,55 +1589,55 @@ def main():
             res["times"] = t0 + np.arange(geom["rows"]) * ref.dt
         stems_out = outputs
 
+    unwrapper = None
+    if need_unwrap:
+        nprocs = int(options["nprocs"] or 0)
+        if nprocs < 0:
+            nprocs = max(1, (os.cpu_count() or 1) + nprocs)
+        unwrapper = Unwrapper(options["device"], options["platform"], nprocs)
+        gs.verbose(_("Unwrapping preparation on {}").format(unwrapper.device))
+    settings = {
+        "measures": measures,
+        "removal": removal,
+        "win": win,
+        "looks": looks,
+        "alpha": alpha,
+        "fsize": fsize,
+        "info": info,
+        "reference_point": reference_point,
+        "unwrap_mask": float(options["unwrap_mask"]),
+    }
     for res, stem in zip(results, stems_out):
         write_products(
-            options,
-            res,
-            stem,
-            measures,
-            removal,
-            win,
-            looks,
-            alpha,
-            fsize,
-            info,
-            ref,
-            sec,
-            axis,
+            options, res, stem, settings, ref, sec, axis, unwrapper, geocoder
         )
+    if unwrapper:
+        unwrapper.finish()
     return 0
 
 
-def write_products(
-    options,
-    res,
-    stem,
-    measures,
-    removal,
-    win,
-    looks,
-    alpha,
-    fsize,
-    info,
-    ref,
-    sec,
-    axis,
-):
+def write_products(options, res, stem, settings, ref, sec, axis, unwrapper, geocoder):
     import numpy as np
 
+    measures, looks, alpha = settings["measures"], settings["looks"], settings["alpha"]
     ifg = multilook(res["ifg"], looks[0], looks[1])
     coh = multilook(res["coh"], looks[0], looks[1]) if res["coh"] is not None else None
-    phase = res["phase"]
+    inc = multilook(res["inc"], looks[0], looks[1])
     if "reference_phase" in measures:
         ref_phase = np.angle(
-            multilook(np.exp(1j * phase).astype(np.complex64), looks[0], looks[1])
+            multilook(
+                np.exp(1j * res["phase"]).astype(np.complex64), looks[0], looks[1]
+            )
         )
     if alpha > 0:
         gs.message(
-            _("Goldstein filtering (alpha {}, blocks of {})...").format(alpha, fsize)
+            _("Goldstein filtering (alpha {}, blocks of {})...").format(
+                alpha, settings["fsize"]
+            )
         )
-        ifg = goldstein(ifg, alpha, fsize)
+        ifg = goldstein(ifg, alpha, settings["fsize"])
     rows, cols = ifg.shape
+    geometry = ProductGeometry(ref, res["times"], looks[0], looks[1])
     geom = dict(res["geom"])
     geom.update(
         {
@@ -1068,9 +1647,7 @@ def write_products(
             "looks_azimuth": looks[1],
             "azimuth_time_interval": ref.dt * looks[1],
             "range_pixel_spacing": geom.get("range_pixel_spacing", 0) * looks[0],
-            "first_line_time": axis.iso(
-                res["times"][0] + 0.5 * (looks[1] - 1) * ref.dt
-            ),
+            "first_line_time": axis.iso(geometry.t0),
         }
     )
     if looks != [1, 1]:
@@ -1086,35 +1663,81 @@ def write_products(
     pair_text = "{} / {}".format(
         r_meta["product"].get("product_name"), s_meta["product"].get("product_name")
     )
-    t_ref = axis.datetime(ref.first_line_time)
-    t_sec = axis.datetime(sec.first_line_time)
+    t_ref, t_sec = sorted(
+        [axis.datetime(ref.first_line_time), axis.datetime(sec.first_line_time)]
+    )
     stamp = "{}/{}".format(
         t_ref.strftime("%d %b %Y %H:%M:%S"), t_sec.strftime("%d %b %Y %H:%M:%S")
     )
-    if t_sec < t_ref:
-        stamp = "{}/{}".format(
-            t_sec.strftime("%d %b %Y %H:%M:%S"), t_ref.strftime("%d %b %Y %H:%M:%S")
-        )
     insar = {
         "reference": options["reference"],
         "secondary": options["secondary"],
         "reference_product": r_meta["product"].get("product_name"),
         "secondary_product": s_meta["product"].get("product_name"),
-        "phase_removal": removal,
-        "coherence_window": {"range": win[0], "azimuth": win[1]},
+        "phase_removal": settings["removal"],
+        "coherence_window": {
+            "range": settings["win"][0],
+            "azimuth": settings["win"][1],
+        },
         "looks": {"range": looks[0], "azimuth": looks[1]},
-        "goldstein": {"alpha": alpha, "fft_size": fsize, "window": FILTER_WINDOW}
+        "goldstein": {
+            "alpha": alpha,
+            "fft_size": settings["fsize"],
+            "window": FILTER_WINDOW,
+        }
         if alpha > 0
         else None,
-        "baselines": info,
+        "baselines": settings["info"],
         "coregistration": s_meta.get("coregistration"),
         "wavelength": ref.wavelength,
         "sign_convention": "phase = arg(reference * conj(secondary)) - reference_phase",
     }
-    secondary_meta = {
-        "product": s_meta["product"],
-        "swath": {k: v for k, v in s_meta["swath"].items() if k != "geolocation_grid"},
-    }
+
+    unwrapped = None
+    if unwrapper is not None:
+        wrapped = np.angle(ifg).astype(np.float32)
+        wrapped[~np.isfinite(ifg)] = np.nan
+        coh_u = coh if coh is not None else np.ones(wrapped.shape, dtype=np.float32)
+        if settings["unwrap_mask"] > 0:
+            wrapped[~(coh_u >= settings["unwrap_mask"])] = np.nan
+        gs.message(
+            _("Unwrapping the phase of <{}> ({} x {})...").format(stem, rows, cols)
+        )
+        unw, comp, stats = unwrapper.run(wrapped, coh_u, max(1, looks[0] * looks[1]))
+        ref_rc = None
+        if settings["reference_point"]:
+            lon, lat = settings["reference_point"]
+            terrain = float(sw.get("terrain_height") or 0.0)
+            ref_rc = reference_pixel(geometry, lon, lat, terrain, rows, cols)
+        unwrapped, offsets = set_reference(unw, comp, ref_rc)
+        gs.message(
+            _("Unwrapping: {} residues, {} connected components").format(
+                stats["residues"], stats["components"]
+            )
+        )
+        if stats["components"] > 1:
+            gs.warning(
+                _(
+                    "{} connected components: each is referenced separately (the "
+                    "reference point, or its median), their relative offsets are unknown"
+                ).format(stats["components"])
+            )
+        los = -ref.wavelength / (4.0 * np.pi) * unwrapped
+        with np.errstate(invalid="ignore"):
+            vertical = los / np.cos(np.radians(inc))
+        insar["unwrapping"] = dict(
+            stats,
+            method="minimum cost flow, statistical costs (Costantini 1998, SNAPHU-like)",
+            coherence_mask=settings["unwrap_mask"],
+            noise_looks=max(1, looks[0] * looks[1]),
+            reference_point=settings["reference_point"],
+            reference_pixel=list(ref_rc) if ref_rc else None,
+            component_offsets={str(k): v for k, v in offsets.items()},
+        )
+        insar["displacement"] = {
+            "los": "-wavelength / (4 pi) * unwrapped_phase, positive towards the satellite",
+            "vertical": "los / cos(incidence_angle), vertical motion only, negative for subsidence",
+        }
 
     products = []
     for m in measures:
@@ -1122,7 +1745,7 @@ def write_products(
             products.append(
                 ("phase", np.angle(ifg), "radians", "wrapped interferometric phase")
             )
-        elif m == "coherence" and coh is not None:
+        elif m == "coherence":
             products.append(("coherence", coh, "", "coherence"))
         elif m == "amplitude":
             products.append(("amplitude", np.abs(ifg), "", "interferogram amplitude"))
@@ -1133,49 +1756,73 @@ def write_products(
             products.append(
                 ("reference_phase", ref_phase, "radians", "removed synthetic phase")
             )
+        elif m == "incidence_angle":
+            products.append(("incidence_angle", inc, "degrees", "incidence angle"))
+        elif m == "unwrapped_phase":
+            products.append(
+                ("unwrapped_phase", unwrapped, "radians", "unwrapped phase")
+            )
+        elif m == "los_displacement":
+            products.append(
+                ("los_displacement", los, "meters", "line of sight displacement")
+            )
+        elif m == "vertical_displacement":
+            products.append(
+                ("vertical_displacement", vertical, "meters", "vertical displacement")
+            )
+        elif m == "unwrap_component":
+            products.append(
+                (
+                    "unwrap_component",
+                    np.where(comp > 0, comp, np.nan),
+                    "",
+                    "unwrapping components",
+                )
+            )
+
     env = gs.gisenv()
     mapset_dir = os.path.join(env["GISDBASE"], env["LOCATION_NAME"], env["MAPSET"])
     names = []
+    base_meta = {
+        "product": r_meta["product"],
+        "swath": sw,
+        "secondary": {
+            "product": s_meta["product"],
+            "swath": {
+                k: v for k, v in s_meta["swath"].items() if k != "geolocation_grid"
+            },
+        },
+        "interferometry": insar,
+    }
+    finished = []
     for key, data, units, what in products:
         name = "{}_{}".format(stem, key)
-        valid = np.isfinite(ifg) if key != "reference_phase" else np.isfinite(data)
+        if key in ("reference_phase", "incidence_angle"):
+            valid = np.isfinite(data)
+        else:
+            valid = np.isfinite(ifg) & np.isfinite(data)
         data = np.where(valid, data, np.nan)
         title = "{} {} {} {} {} ({})".format(
             mission, sw.get("mode"), sw.get("swath"), pol, what, pair_text
         )
         write_raster(name, data, title)
-        gs.run_command(
-            "r.support",
-            map=name,
-            title=title,
-            units=units,
-            source1=r_meta["product"].get("product_name") or "",
-            source2=s_meta["product"].get("product_name") or "",
-            description="i.sar.interferometry: {} removed; B_perp {:.1f} m; metadata in cell_misc/{}/description.json".format(
-                removal, info["perpendicular"], name
-            ),
-            semantic_label="S1_{}_IFG_{}".format(pol, key.upper()),
-            quiet=True,
+        meta = dict(base_meta, raster_geometry=geom, measure=key)
+        finish_map(
+            name,
+            title,
+            units,
+            key,
+            pol,
+            stamp,
+            settings,
+            r_meta,
+            s_meta,
+            meta,
+            mapset_dir,
+            None,
         )
-        gs.run_command("r.timestamp", map=name, date=stamp, quiet=True)
-        gs.raster_history(name, overwrite=True)
-        if key == "coherence":
-            gs.run_command("r.colors", map=name, color="grey", quiet=True)
-        elif key in ("phase", "reference_phase"):
-            gs.run_command("r.colors", map=name, color="rainbow", quiet=True)
-        meta = {
-            "product": r_meta["product"],
-            "swath": sw,
-            "secondary": secondary_meta,
-            "raster_geometry": geom,
-            "interferometry": insar,
-            "measure": key,
-        }
-        meta_dir = os.path.join(mapset_dir, "cell_misc", name)
-        os.makedirs(meta_dir, exist_ok=True)
-        with open(os.path.join(meta_dir, "description.json"), "w") as fd:
-            json.dump(meta, fd, indent=1)
         names.append(name)
+        finished.append((key, name, data, units, title))
     gs.run_command("i.group", group=stem, input=names, quiet=True)
     npts = write_gcps(stem, ref, res["times"], rows, looks[1], looks[0], cols)
     gs.message(
@@ -1183,6 +1830,97 @@ def write_products(
             stem, len(names), npts
         )
     )
+
+    if geocoder is not None:
+        spacing = max(
+            C
+            / (2.0 * ref.fs)
+            / np.sin(np.radians(float(np.nanmedian(inc))))
+            * looks[0],
+            float(sw.get("azimuth_pixel_spacing") or 14.0) * looks[1],
+        )
+        geocoder.setup(geometry, rows, cols, spacing)
+        gs.message(
+            _("Geocoding into <{}@{}> ({} x {} cells of {:g})...").format(
+                geocoder.target,
+                geocoder.mapset,
+                geocoder.rows,
+                geocoder.cols,
+                geocoder.res,
+            )
+        )
+        tdir = geocoder.path
+        for key, name, data, units, title in finished:
+            values = geocoder.sample(data, key in NEAREST)
+            geocoder.write(name, values, title)
+            meta = dict(
+                base_meta,
+                measure=key,
+                radar_geometry=geom,
+                geocoding={
+                    "method": "range-Doppler terrain correction",
+                    "source": "{}@{}".format(name, env["MAPSET"]),
+                    "source_project": env["LOCATION_NAME"],
+                    "resampling": "nearest" if key in NEAREST else "bilinear",
+                    "dem": options["dem"] or None,
+                    "dem_height": options["dem_height"] if options["dem"] else None,
+                    "terrain_height": None
+                    if options["dem"]
+                    else geocoder.terrain_height,
+                    "resolution": geocoder.res,
+                },
+            )
+            finish_map(
+                name,
+                title,
+                units,
+                key,
+                pol,
+                stamp,
+                settings,
+                r_meta,
+                s_meta,
+                meta,
+                tdir,
+                geocoder.env,
+            )
+
+
+def finish_map(
+    name, title, units, key, pol, stamp, settings, r_meta, s_meta, meta, mapset_dir, env
+):
+    """Metadata, timestamp, history and colors of an output map."""
+    gs.run_command(
+        "r.support",
+        map=name,
+        title=title,
+        units=units,
+        source1=r_meta["product"].get("product_name") or "",
+        source2=s_meta["product"].get("product_name") or "",
+        description="i.sar.interferometry: {} removed; B_perp {:.1f} m; metadata in cell_misc/{}/description.json".format(
+            settings["removal"], settings["info"]["perpendicular"], name
+        ),
+        semantic_label="S1_{}_IFG_{}".format(pol, key.upper()),
+        quiet=True,
+        env=env,
+    )
+    gs.run_command("r.timestamp", map=name, date=stamp, quiet=True, env=env)
+    gs.raster_history(name, overwrite=True, env=env)
+    colors = {
+        "coherence": "grey",
+        "phase": "rainbow",
+        "reference_phase": "rainbow",
+        "unwrapped_phase": "differences",
+        "los_displacement": "differences",
+        "vertical_displacement": "differences",
+        "unwrap_component": "rainbow",
+    }
+    if key in colors:
+        gs.run_command("r.colors", map=name, color=colors[key], quiet=True, env=env)
+    meta_dir = os.path.join(mapset_dir, "cell_misc", name)
+    os.makedirs(meta_dir, exist_ok=True)
+    with open(os.path.join(meta_dir, "description.json"), "w") as fd:
+        json.dump(meta, fd, indent=1)
 
 
 if __name__ == "__main__":
