@@ -1,0 +1,108 @@
+<h2 id="description">DESCRIPTION</h2>
+<p><em>i.sar.interferometry</em> forms the interferogram of a Sentinel-1
+TOPS SLC pair and derives its phase, coherence and amplitude. The
+<strong>reference</strong> image is a complex image imported by
+<em>r.in.s1slc</em>; the <strong>secondary</strong> image is the output
+of <em>i.sar.coregistration</em> for that reference. The processing
+follows ESA SNAP (microwave toolbox) <em>Interferogram</em>,
+<em>TOPSAR-Deburst</em>, <em>Multilook</em> and <em>Goldstein Phase
+Filtering</em>.</p>
+<ul>
+<li><strong>Interferogram</strong>: m s<sup>*</sup>
+e<sup>-jφ<sub>ref</sub></sup>, m and s being the reference and
+coregistered secondary complex values and φ<sub>ref</sub> the synthetic
+phase selected by <strong>phase_removal</strong>: nothing, the
+flat-earth phase of the WGS84 ellipsoid, or the phase of the terrain
+given by the <code>elevation</code> maps that
+<em>i.sar.coregistration</em> writes with
+<strong>extra=elevation</strong> and a DEM. The synthetic phase is -4π
+(R<sub>ref</sub> - R<sub>sec</sub>) / λ, the slant ranges of each ground
+point from the reference and secondary orbits; it is computed exactly on
+a grid of nodes (every 10 lines and 100 samples, at two heights
+enclosing the terrain) and interpolated.</li>
+<li><strong>Coherence</strong>: |⟨m
+s<sup>*</sup>e<sup>-jφ<sub>ref</sub></sup>⟩| / √(⟨|m|²⟩⟨|s|²⟩) over a
+moving window of <strong>coherence_window</strong> samples and lines,
+after removal of the synthetic phase (whose fringes would otherwise bias
+the estimate low).</li>
+<li><strong>Debursting</strong>: with burst maps (<em>r.in.s1slc</em>
+<strong>-b</strong>), the burst interferograms are merged like
+<em>r.in.s1slc</em> debursts images (SNAP <em>TOPSAR-Deburst</em>): rows
+are sampled every azimuth time interval, the burst switching in the
+middle of each overlap. The output then has exactly the geometry of the
+debursted reference image. The <strong>-b</strong> flag keeps one set of
+maps per burst instead.</li>
+<li><strong>Multilooking</strong>: <strong>looks</strong> averages the
+complex interferogram and the coherence over blocks of samples and
+lines.</li>
+<li><strong>Goldstein filtering</strong>: with
+<strong>filter_alpha</strong> above 0 the (multilooked) interferogram is
+filtered in blocks of <strong>filter_size</strong> samples overlapping
+by three quarters: the spectrum of each block is weighted by its 3 × 3
+smoothed magnitude to the power alpha, and the blocks are recombined
+with triangular weights. The coherence is not filtered.</li>
+</ul>
+<h3 id="output">Output</h3>
+<p>The maps are named <code>{output}_{measure}</code>
+(<code>{output}_bNN_{measure}</code> with <strong>-b</strong>):</p>
+<ul>
+<li><code>phase</code>: wrapped interferometric phase (radians), arg(m
+s*) minus the synthetic phase;</li>
+<li><code>coherence</code>: coherence magnitude (0 to 1);</li>
+<li><code>amplitude</code>: interferogram amplitude |m s*|;</li>
+<li><code>i</code>, <code>q</code> (<code>complex</code>): real and
+imaginary parts of the interferogram;</li>
+<li><code>reference_phase</code>: removed synthetic phase, wrapped.</li>
+</ul>
+<p>They are FCELL maps in the radar geometry of the reference (one cell
+per sample and line, or per look), with timestamps spanning the two
+acquisitions, semantic labels (e.g. <code>S1_VV_IFG_PHASE</code>) and a
+<code>cell_misc/&lt;map&gt;/description.json</code> file holding the
+reference product and annotation, the secondary product and annotation,
+the raster geometry (debursting segments, looks) and an
+<code>interferometry</code> section: phase removal, windows, filter, the
+coregistration record and the baselines at the scene centre
+(perpendicular baseline, positive when the secondary orbit is above the
+reference one; parallel baseline; temporal baseline; incidence angle;
+height of ambiguity).</p>
+<p>An imagery group <code>{output}</code> holds the maps and ground
+control points from the reference geolocation grid, for geocoding with
+<em>i.rectify</em>.</p>
+<h2 id="notes">NOTES</h2>
+<p>The current project must be unprojected (XY). The computational
+region is not used.</p>
+<p>The interferogram is only as good as the coregistration: burst maps
+coregistered with ESD avoid phase jumps at the burst seams. Phase
+unwrapping, conversion to displacement or height and geocoding are left
+to other tools.</p>
+<p>The module requires NumPy.</p>
+<h2 id="examples">EXAMPLES</h2>
+<p>Interferogram and coherence of a pair coregistered with a DEM, the
+topographic phase removed, with 4 × 1 looks and Goldstein filtering:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">i.sar.coregistration</span> reference=s1_20230112_iw2_vv secondary=s1_20230124_iw2_vv <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    output=s1_20230124_co dem=copernicus_dem_30m.tif extra=elevation</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">i.sar.interferometry</span> reference=s1_20230112_iw2_vv secondary=s1_20230124_co <span class="dt">\</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    output=ifg_20230112_20230124 phase_removal=topography looks=4,1 filter_alpha=0.5</span></code></pre></div>
+<p>Geocode the phase and the coherence into a UTM project:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">i.target</span> group=ifg_20230112_20230124 location=sharjah_utm40n mapset=PERMANENT</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">i.rectify</span> <span class="at">-t</span> group=ifg_20230112_20230124 extension=_utm resolution=15</span></code></pre></div>
+<h2 id="references">REFERENCES</h2>
+<ul>
+<li>R. M. Goldstein and C. L. Werner, <em>Radar interferogram filtering
+for geophysical applications</em>, Geophysical Research Letters, 25(21),
+4035-4038, 1998.</li>
+<li>N. Yagüe-Martínez et al., <em>Interferometric Processing of
+Sentinel-1 TOPS Data</em>, IEEE Transactions on Geoscience and Remote
+Sensing, 54(4), 2220-2234, 2016.</li>
+<li>ESA SNAP microwave toolbox: <a
+href="https://github.com/senbox-org/microwave-toolbox">https://github.com/senbox-org/microwave-toolbox</a></li>
+</ul>
+<h2 id="see-also">SEE ALSO</h2>
+<p><em><a
+href="https://grass.osgeo.org/grass-stable/manuals/i.group.html">i.group</a>,
+<a
+href="https://grass.osgeo.org/grass-stable/manuals/i.rectify.html">i.rectify</a>,
+<a href="i.sar.coregistration.html">i.sar.coregistration</a>, <a
+href="r.in.s1slc.html">r.in.s1slc</a></em></p>
+<h2 id="authors">AUTHORS</h2>
+<p>Yann Chemin</p>
